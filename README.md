@@ -10,6 +10,66 @@
 
 AutoCompoundHook revolutionizes Uniswap V4 liquidity management by automating critical tasks, maximizing returns with minimal effort. Seamlessly integrated into Dex Mini, this innovative hook eliminates manual intervention while optimizing capital efficiency through intelligent compounding and risk mitigation.
 
+## 🔄 System Architecture
+
+### Core Workflow
+```mermaid
+flowchart TB
+    A[LP Deposits] --> B[Position Creation]
+    B --> C{AutoCompoundHook}
+    C -->|Every Hour| D[Fee Collection]
+    C -->|Price Deviation| E[Position Rebalancing]
+    C -->|Continuous| F[TWAP Monitoring]
+    
+    D --> G[Fee Distribution]
+    G --> H[Reinvestment]
+    H --> C
+    
+    E --> I[Range Calculation]
+    I --> J[Liquidity Migration]
+    J --> C
+    
+    F --> K[Price Validation]
+    K -->|>10 ticks| E
+    K -->|Within Range| C
+```
+
+### Fee Compounding Process
+```mermaid
+flowchart LR
+    A[Swap Event] -->|Triggers| B[Fee Accrual]
+    B --> C{Compound Check}
+    C -->|Hour Passed| D[Calculate Shares]
+    C -->|Not Ready| B
+    D --> E[Convert Fees]
+    E --> F[Add Liquidity]
+    F --> G[Update Position]
+```
+
+### Position Rebalancing Logic
+```mermaid
+flowchart TD
+    A[Price Update] --> B{Check TWAP}
+    B -->|Within Range| C[No Action]
+    B -->|Outside Range| D[Calculate New Range]
+    D --> E[Withdraw Liquidity]
+    E --> F[Deploy to New Range]
+    F --> G[Update State]
+    G --> H[Emit Events]
+```
+
+### Security Flow
+```mermaid
+flowchart LR
+    A[Action Request] --> B{Permission Check}
+    B -->|Authorized| C[Reentrancy Guard]
+    B -->|Unauthorized| D[Revert]
+    C --> E{Validation}
+    E -->|Pass| F[Execute]
+    E -->|Fail| G[Revert]
+    F --> H[Event Log]
+```
+
 ## ⭐ Why Choose AutoCompoundHook?
 
 - 📈 **Effortless Yield Maximization**: Automatically reinvest trading fees hourly
