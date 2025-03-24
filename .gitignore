@@ -13,5 +13,12 @@ docs/
 # Dotenv file
 .env
 
+# Node modules
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+
 # Cursor
 .cursor

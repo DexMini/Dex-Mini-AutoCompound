@@ -9,7 +9,8 @@ remappings = [
     "@uniswap/v4-periphery/=lib/v4-periphery/",
     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
     "forge-std/=lib/forge-std/src/",
-    "solmate/=lib/solmate/src/"
+    "solmate/src/=lib/solmate/src/",
+    "ds-test/=lib/forge-std/lib/ds-test/src/"
 ]
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options

@@ -2,20 +2,25 @@
 pragma solidity ^0.8.0;
 
 // Updated imports with correct paths
-import {BaseHook} from "@uniswap/v4-periphery/src/utils/BaseHook.sol";
-import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
-import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
-import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+import {BaseHook} from "lib/v4-periphery/src/utils/BaseHook.sol";
+import {IPoolManager} from "lib/v4-core/src/interfaces/IPoolManager.sol";
+import {Hooks} from "lib/v4-core/src/libraries/Hooks.sol";
+import {IHooks} from "lib/v4-core/src/interfaces/IHooks.sol";
 import {ReentrancyGuard} from "solmate/src/utils/ReentrancyGuard.sol";
 import {ERC20} from "solmate/src/tokens/ERC20.sol";
-import {LiquidityAmounts} from "@uniswap/v4-core/test/utils/LiquidityAmounts.sol";
-import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
-import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
-import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
-import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {LiquidityAmounts} from "lib/v4-periphery/src/libraries/LiquidityAmounts.sol";
+import {TickMath} from "lib/v4-core/src/libraries/TickMath.sol";
+import {PoolKey} from "lib/v4-core/src/types/PoolKey.sol";
+import {BalanceDelta, BalanceDeltaLibrary} from "lib/v4-core/src/types/BalanceDelta.sol";
+import {Currency} from "lib/v4-core/src/types/Currency.sol";
+import {Slot0} from "lib/v4-core/src/types/Slot0.sol";
+import {StateLibrary} from "lib/v4-core/src/libraries/StateLibrary.sol";
+import {PoolId} from "lib/v4-core/src/types/PoolId.sol";
+import {FixedPoint96} from "lib/v4-core/src/libraries/FixedPoint96.sol";
 
 contract AutoCompoundHook is BaseHook, ReentrancyGuard {
     using Hooks for IPoolManager;
+    using BalanceDeltaLibrary for BalanceDelta;
 
     // Configuration constants
     uint32 public constant TWAP_WINDOW = 3600; // 1-hour TWAP
@@ -74,15 +79,33 @@ contract AutoCompoundHook is BaseHook, ReentrancyGuard {
             Hooks.Permissions({
                 beforeInitialize: false,
                 afterInitialize: false,
-                beforeModifyPosition: false,
-                afterModifyPosition: true,
+                beforeAddLiquidity: false,
+                afterAddLiquidity: false,
+                beforeRemoveLiquidity: false,
+                afterRemoveLiquidity: false,
                 beforeSwap: false,
                 afterSwap: true,
                 beforeDonate: false,
                 afterDonate: false,
-                noOp: false,
-                accessLock: false
+                beforeSwapReturnDelta: false,
+                afterSwapReturnDelta: false,
+                afterAddLiquidityReturnDelta: false,
+                afterRemoveLiquidityReturnDelta: false
             });
+    }
+
+    function _afterSwap(
+        address sender,
+        PoolKey calldata key,
+        IPoolManager.SwapParams calldata params,
+        BalanceDelta delta,
+        bytes calldata hookData
+    ) internal override returns (bytes4, int128) {
+        // Calculate swap fees
+        (uint256 fee0, uint256 fee1) = _calculateSwapFees(key, params, delta);
+        _distributeFeesToActivePositions(key, fee0, fee1);
+
+        return (IHooks.afterSwap.selector, 0);
     }
 
     /// @notice Creates a new liquidity position
@@ -158,14 +181,9 @@ contract AutoCompoundHook is BaseHook, ReentrancyGuard {
         PoolKey calldata key,
         IPoolManager.ModifyLiquidityParams calldata params,
         BalanceDelta delta,
+        BalanceDelta feesAccrued,
         bytes calldata
-    )
-        external
-        override
-        onlyPoolManager
-        nonReentrant
-        returns (bytes4, BalanceDelta)
-    {
+    ) external onlyPoolManager nonReentrant returns (bytes4, BalanceDelta) {
         bytes32 positionId = _getPositionId(
             sender,
             key,
@@ -187,20 +205,6 @@ contract AutoCompoundHook is BaseHook, ReentrancyGuard {
         }
 
         return (this.afterModifyPosition.selector, BalanceDelta.wrap(0));
-    }
-
-    /// @notice Hook executed after swaps to distribute fees
-    function afterSwap(
-        address,
-        PoolKey calldata key,
-        IPoolManager.SwapParams calldata params,
-        BalanceDelta delta,
-        bytes calldata
-    ) external override onlyPoolManager nonReentrant returns (bytes4, int128) {
-        (uint256 fee0, uint256 fee1) = _calculateSwapFees(key, params, delta);
-        _distributeFeesToActivePositions(key, fee0, fee1);
-
-        return (this.afterSwap.selector, 0);
     }
 
     // ================= INTERNAL FUNCTIONS ================= //
@@ -274,17 +278,13 @@ contract AutoCompoundHook is BaseHook, ReentrancyGuard {
         bytes32 positionId
     ) internal {
         Position storage pos = positions[positionId];
-        if (pos.liquidity == 0) return;
+        (uint160 sqrtPriceX96, int24 currentTick) = _getCurrentTick(key);
 
-        (int24 currentTick, ) = _getCurrentTick(key);
-
+        // Skip if position is already in optimal range
         if (
-            !_needsRebalance(
-                pos.lowerTick,
-                pos.upperTick,
-                currentTick,
-                key.tickSpacing
-            )
+            currentTick >= pos.lowerTick &&
+            currentTick <= pos.upperTick &&
+            block.timestamp < pos.lastCompound + MIN_COMPOUND_INTERVAL
         ) {
             return;
         }
@@ -292,9 +292,11 @@ contract AutoCompoundHook is BaseHook, ReentrancyGuard {
         // Remove existing liquidity
         uint256 amount0;
         uint256 amount1;
+        BalanceDelta delta;
+        BalanceDelta feesAccrued;
 
         {
-            BalanceDelta delta = poolManager.modifyLiquidity(
+            (delta, feesAccrued) = poolManager.modifyLiquidity(
                 key,
                 IPoolManager.ModifyLiquidityParams({
                     tickLower: pos.lowerTick,
@@ -306,8 +308,10 @@ contract AutoCompoundHook is BaseHook, ReentrancyGuard {
             );
 
             // Get removed token amounts
-            amount0 = uint256(uint128(BalanceDelta.unwrap(delta).amount0()));
-            amount1 = uint256(uint128(BalanceDelta.unwrap(delta).amount1()));
+            int128 delta0 = delta.amount0();
+            int128 delta1 = delta.amount1();
+            amount0 = uint256(uint128(delta0));
+            amount1 = uint256(uint128(delta1));
         }
 
         // Calculate new range centered around current tick
@@ -325,41 +329,25 @@ contract AutoCompoundHook is BaseHook, ReentrancyGuard {
             amount1
         );
 
-        // Ensure we don't lose too much in the rebalance
-        uint128 minLiquidity = (pos.liquidity * (10_000 - SLIPPAGE_TOLERANCE)) /
-            10_000;
-        require(newLiquidity >= minLiquidity, "Slippage limit exceeded");
-
-        {
-            // Add new liquidity
-            ERC20(Currency.unwrap(key.currency0)).approve(
-                address(poolManager),
-                amount0
-            );
-            ERC20(Currency.unwrap(key.currency1)).approve(
-                address(poolManager),
-                amount1
-            );
-
-            poolManager.modifyLiquidity(
-                key,
-                IPoolManager.ModifyLiquidityParams({
-                    tickLower: newLower,
-                    tickUpper: newUpper,
-                    liquidityDelta: int256(uint256(newLiquidity)),
-                    salt: bytes32(0)
-                }),
-                bytes("")
-            );
-        }
-
         // Update position state
         pos.lowerTick = newLower;
         pos.upperTick = newUpper;
         pos.liquidity = newLiquidity;
+        pos.lastCompound = block.timestamp;
+
+        // Add liquidity back in new range
+        (delta, feesAccrued) = poolManager.modifyLiquidity(
+            key,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: newLower,
+                tickUpper: newUpper,
+                liquidityDelta: int256(uint256(newLiquidity)),
+                salt: bytes32(0)
+            }),
+            bytes("")
+        );
 
         emit PositionRebalanced(positionId, newLower, newUpper);
-        emit LiquidityUpdated(positionId, newLiquidity);
     }
 
     /// @dev Distributes fees to active positions based on their share of liquidity
@@ -402,6 +390,27 @@ contract AutoCompoundHook is BaseHook, ReentrancyGuard {
         pool.lastProcessedIndex = end >= pool.positionIds.length ? 0 : end;
     }
 
+    function _modifyPosition(
+        PoolKey calldata key,
+        IPoolManager.ModifyLiquidityParams calldata params
+    ) internal returns (uint256 amount0, uint256 amount1) {
+        (BalanceDelta delta, ) = poolManager.modifyLiquidity(key, params, "");
+
+        int128 delta0 = delta.amount0();
+        int128 delta1 = delta.amount1();
+        amount0 = uint256(uint128(delta0));
+        amount1 = uint256(uint128(delta1));
+    }
+
+    function _getCurrentTick(
+        PoolKey memory key
+    ) internal view returns (uint160 sqrtPriceX96, int24 currentTick) {
+        (sqrtPriceX96, currentTick, , ) = StateLibrary.getSlot0(
+            poolManager,
+            PoolId.wrap(keccak256(abi.encode(key)))
+        );
+    }
+
     // ================= HELPER FUNCTIONS ================= //
 
     /// @dev Checks if position is currently active (in range)
@@ -409,7 +418,7 @@ contract AutoCompoundHook is BaseHook, ReentrancyGuard {
         Position storage pos,
         PoolKey calldata key
     ) internal view returns (bool) {
-        (int24 currentTick, ) = _getCurrentTick(key);
+        (uint160 sqrtPriceX96, int24 currentTick) = _getCurrentTick(key);
         return currentTick >= pos.lowerTick && currentTick <= pos.upperTick;
     }
 
@@ -445,25 +454,17 @@ contract AutoCompoundHook is BaseHook, ReentrancyGuard {
         PoolKey calldata key,
         IPoolManager.SwapParams calldata params,
         BalanceDelta delta
-    ) internal pure returns (uint256 fee0, uint256 fee1) {
-        // Get absolute swap amount
-        uint256 amount0 = params.zeroForOne
-            ? uint256(uint128(-BalanceDelta.unwrap(delta).amount0()))
-            : 0;
-        uint256 amount1 = !params.zeroForOne
-            ? uint256(uint128(-BalanceDelta.unwrap(delta).amount1()))
-            : 0;
+    ) internal view returns (uint256 fee0, uint256 fee1) {
+        int128 delta0 = delta.amount0();
+        int128 delta1 = delta.amount1();
 
-        // Calculate fees based on pool fee tier
-        fee0 = (amount0 * key.fee) / 1_000_000;
-        fee1 = (amount1 * key.fee) / 1_000_000;
-    }
-
-    /// @dev Gets current tick from pool
-    function _getCurrentTick(
-        PoolKey calldata key
-    ) internal view returns (int24 tick, uint160 sqrtPriceX96) {
-        (sqrtPriceX96, tick, , , ) = poolManager.getSlot0(key);
+        // Calculate fees based on deltas
+        fee0 =
+            (uint256(uint128(delta0 > 0 ? delta0 : -delta0)) * key.fee) /
+            1e6;
+        fee1 =
+            (uint256(uint128(delta1 > 0 ? delta1 : -delta1)) * key.fee) /
+            1e6;
     }
 
     /// @dev Calculates liquidity from token amounts
@@ -475,8 +476,8 @@ contract AutoCompoundHook is BaseHook, ReentrancyGuard {
         uint256 amount1
     ) internal view returns (uint128 liquidity) {
         (uint160 sqrtPriceX96, ) = _getCurrentTick(key);
-        uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(lowerTick);
-        uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(upperTick);
+        uint160 sqrtRatioAX96 = TickMath.getSqrtPriceAtTick(lowerTick);
+        uint160 sqrtRatioBX96 = TickMath.getSqrtPriceAtTick(upperTick);
 
         liquidity = LiquidityAmounts.getLiquidityForAmounts(
             sqrtPriceX96,
@@ -495,20 +496,15 @@ contract AutoCompoundHook is BaseHook, ReentrancyGuard {
         uint128 liquidity
     ) internal view returns (uint256 amount0, uint256 amount1) {
         (uint160 sqrtPriceX96, ) = _getCurrentTick(key);
-        uint160 sqrtRatioAX96 = TickMath.getSqrtRatioAtTick(lowerTick);
-        uint160 sqrtRatioBX96 = TickMath.getSqrtRatioAtTick(upperTick);
+        uint160 sqrtRatioAX96 = TickMath.getSqrtPriceAtTick(lowerTick);
+        uint160 sqrtRatioBX96 = TickMath.getSqrtPriceAtTick(upperTick);
 
-        amount0 = LiquidityAmounts.getAmount0ForLiquidity(
-            sqrtRatioAX96,
-            sqrtRatioBX96,
-            liquidity
-        );
-
-        amount1 = LiquidityAmounts.getAmount1ForLiquidity(
-            sqrtRatioAX96,
-            sqrtRatioBX96,
-            liquidity
-        );
+        amount0 =
+            (uint256(liquidity) * (sqrtRatioBX96 - sqrtRatioAX96)) /
+            FixedPoint96.Q96;
+        amount1 =
+            (uint256(liquidity) * (sqrtRatioBX96 - sqrtRatioAX96)) /
+            FixedPoint96.Q96;
     }
 
     /// @dev Generates position ID using cryptographic hashing
