@@ -10,14 +10,30 @@
 
 AutoCompoundHook revolutionizes Uniswap V4 liquidity management by automating critical tasks, maximizing returns with minimal effort. Seamlessly integrated into Dex Mini, this innovative hook eliminates manual intervention while optimizing capital efficiency through intelligent compounding and risk mitigation.
 
-```mermaid
-graph TD;
-    A[Liquidity Provider] -->|createPosition()/modifyPosition()| B[PoolManager];
-    C[Swap User (Alice)] -->|swap()| B;
-    B -->|Triggers| D[AutoCompoundHook];
-    D -->|Rebalance| D;
-    D -->|Compound Fees| D;
-    D -->|Track Swap Fees| D;
+```plaintext
+┌──────────────┐               ┌───────────────┐
+│ Liquidity    │               │ Swap User     │
+│ Provider     │               │ (Alice)       │
+└──────┬───────┘               └──────┬────────┘
+       │                              │
+       │ createPosition()             │ swap()
+       │ modifyPosition()             │
+       ▼                              ▼
+┌───────────────────────────────────────────────┐
+│             PoolManager                       │
+│ - modifyPosition() → afterModifyPosition()    │
+│ - swap() → afterSwap()                        │
+└───────────────────────────────────────────────┘
+       │
+       │ Triggers
+       ▼
+┌─────────────────────┐
+│ AutoCompoundHook    │
+│ - Rebalance         │
+│ - Compound Fees     │
+│ - Track Swap Fees   │
+└─────────────────────┘
+
 ```
 
 ## 🔄 System Architecture
